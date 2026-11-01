@@ -152,11 +152,23 @@ export class WyzeCloud {
         };
     }
 
+    // after a 429, no request is sent to Wyze until this time, so retries can't extend the lockout.
+    blockedUntil = 0;
+    private loginInFlight?: Promise<WyzeTokens>;
+    loginAttempts = 0;
+
+    private checkBlocked(what: string) {
+        const wait = this.blockedUntil - Date.now();
+        if (wait > 0)
+            throw new WyzeRateLimitError(wait, `${what}: waiting out Wyze rate limit, ${Math.round(wait / 1000)}s left`);
+    }
+
     private async readJson(res: Response, what: string) {
         if (res.status === 429) {
             const reset = res.headers.get('X-RateLimit-Reset-By');
             const resetMs = reset ? Date.parse(reset) : NaN;
             const wait = !isNaN(resetMs) ? Math.max(resetMs - Date.now(), 30000) : 60000;
+            this.blockedUntil = Date.now() + wait;
             throw new WyzeRateLimitError(wait, `${what}: rate limited by Wyze, retry in ${Math.round(wait / 1000)}s`);
         }
         const text = await res.text();
@@ -177,7 +189,18 @@ export class WyzeCloud {
         return json;
     }
 
-    async login(): Promise<WyzeTokens> {
+    /**
+     * Sign in. Concurrent callers share one request; Wyze rate limits logins hard.
+     */
+    login(): Promise<WyzeTokens> {
+        if (!this.loginInFlight)
+            this.loginInFlight = this.doLogin().finally(() => this.loginInFlight = undefined);
+        return this.loginInFlight;
+    }
+
+    private async doLogin(): Promise<WyzeTokens> {
+        this.checkBlocked('login');
+        this.loginAttempts++;
         const phoneId = this.tokens?.phoneId || randomPhoneId();
         const res = await fetch(`${this.authApi}/api/user/login`, {
             method: 'POST',
@@ -206,6 +229,7 @@ export class WyzeCloud {
     async refresh(): Promise<WyzeTokens> {
         if (!this.tokens?.refreshToken)
             return this.login();
+        this.checkBlocked('token refresh');
         try {
             const res = await fetch(`${this.wyzeApi}/user/refresh_token`, {
                 method: 'POST',
@@ -221,6 +245,8 @@ export class WyzeCloud {
             return this.tokens;
         }
         catch (e) {
+            if (e instanceof WyzeRateLimitError)
+                throw e;
             this.console.warn('token refresh failed, signing in again.', (e as Error).message);
             return this.login();
         }
@@ -230,6 +256,7 @@ export class WyzeCloud {
      * Run a request, refreshing the token once if Wyze says it expired.
      */
     private async authed<T>(fn: () => Promise<T>): Promise<T> {
+        this.checkBlocked('request');
         if (!this.tokens)
             await this.login();
         try {

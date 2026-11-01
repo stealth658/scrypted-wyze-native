@@ -1,6 +1,6 @@
 {
   "name": "@stealth658/scrypted-wyze-native",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Wyze cameras in Scrypted with local P2P video (bundled go2rtc) and the cameras' own motion detection",
   "license": "MIT",
   "scripts": {

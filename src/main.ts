@@ -20,6 +20,8 @@ import path from 'path';
 import { Go2rtc, GO2RTC_VERSION } from './go2rtc';
 import { go2rtcSourceUrl, WyzeCamera, WyzeCloud, WyzeEvent, WyzeRateLimitError, WyzeTokens } from './wyze-cloud';
 
+const CREDENTIAL_KEYS = ['email', 'password', 'apiId', 'apiKey'];
+
 const { deviceManager } = sdk;
 
 // friendly names for models in go2rtc's Wyze compatibility list.
@@ -120,6 +122,9 @@ export class WyzeNativePlugin extends ScryptedDeviceBase implements DeviceProvid
     go2rtc: Go2rtc;
     cloud?: WyzeCloud;
     private pollTimer?: NodeJS.Timeout;
+    private refreshTimer?: NodeJS.Timeout;
+    private credentialTimer?: NodeJS.Timeout;
+    private startGeneration = 0;
     private seenEvents: string[] = [];
     private lastEventMs = Date.now();
     private cloudStatus = 'Not signed in';
@@ -155,8 +160,12 @@ export class WyzeNativePlugin extends ScryptedDeviceBase implements DeviceProvid
     }
 
     async start() {
+        const generation = ++this.startGeneration;
+        clearTimeout(this.refreshTimer);
         // start streaming from the cached camera list first, so video works even if Wyze's cloud is down.
         await this.applyCameras();
+        if (generation !== this.startGeneration)
+            return;
         if (!this.configured) {
             this.cloudStatus = 'Enter your Wyze email, password, API ID and API key in settings.';
             this.console.warn(this.cloudStatus);
@@ -176,8 +185,13 @@ export class WyzeNativePlugin extends ScryptedDeviceBase implements DeviceProvid
         }
         catch (e) {
         }
+        // keep the rate limit lockout across restarts of the cloud client.
+        const blockedUntil = parseInt(this.storage.getItem('blockedUntil') || '0');
+        if (blockedUntil > Date.now())
+            this.cloud.blockedUntil = blockedUntil;
         await this.refreshCameras();
-        this.schedulePoll(1000);
+        if (generation === this.startGeneration)
+            this.schedulePoll(1000);
     }
 
     async refreshCameras() {
@@ -192,11 +206,26 @@ export class WyzeNativePlugin extends ScryptedDeviceBase implements DeviceProvid
                 this.console.warn(`skipping ${c.nickname} (${c.model}): no local IP or P2P id. Newer Gwell-based models are not supported by go2rtc yet.`);
             this.cameras = new Map(usable.map(c => [c.mac, c]));
             this.storage.setItem('cameraCache', JSON.stringify(usable));
+            this.storage.removeItem('blockedUntil');
             this.cloudStatus = `Signed in, ${usable.length} camera(s) at ${new Date().toLocaleTimeString()}`;
             await this.applyCameras();
         }
         catch (e) {
-            this.cloudStatus = `Error: ${(e as Error).message}`;
+            const cloud = this.cloud;
+            if (e instanceof WyzeRateLimitError) {
+                // retry by itself once Wyze's lockout ends, plus a little slack.
+                const wait = e.retryAfterMs + 5000;
+                this.storage.setItem('blockedUntil', String(cloud?.blockedUntil || 0));
+                this.cloudStatus = `Rate limited by Wyze, retrying automatically at ${new Date(Date.now() + wait).toLocaleTimeString()}`;
+                clearTimeout(this.refreshTimer);
+                this.refreshTimer = setTimeout(() => {
+                    if (this.cloud === cloud)
+                        this.refreshCameras();
+                }, wait);
+            }
+            else {
+                this.cloudStatus = `Error: ${(e as Error).message}`;
+            }
             this.console.error('could not load cameras from Wyze; using the cached list.', (e as Error).message);
         }
     }
@@ -271,8 +300,9 @@ export class WyzeNativePlugin extends ScryptedDeviceBase implements DeviceProvid
             .filter(c => !this.ignored().has(c.mac.toUpperCase()))
             .filter(c => this.getCameraDevice(c.mac)?.cloudMotionEnabled !== false)
             .map(c => c.mac);
-        if (!this.cloud || !watched.length) {
-            this.motionStatus = watched.length ? 'Not signed in' : 'No cameras with Wyze Motion on';
+        if (!this.cloud?.tokens || !watched.length) {
+            // motion polling never signs in by itself; refreshCameras handles sign-in and its backoff.
+            this.motionStatus = watched.length ? 'Waiting for Wyze sign-in' : 'No cameras with Wyze Motion on';
             this.schedulePoll(15000);
             return;
         }
@@ -391,12 +421,22 @@ export class WyzeNativePlugin extends ScryptedDeviceBase implements DeviceProvid
             this.refreshCameras();
             return;
         }
+        const previous = this.storage.getItem(key);
         this.storage.setItem(key, value?.toString() ?? '');
-        if (['email', 'password', 'apiId', 'apiKey'].includes(key)) {
+        if (CREDENTIAL_KEYS.includes(key)) {
+            if (previous === (value?.toString() ?? '')) {
+                this.onDeviceEvent(ScryptedInterface.Settings, undefined);
+                return;
+            }
+            // the settings page saves each field separately; wait for the last one, then sign in once.
             this.storage.removeItem('tokens');
             this.cloud = undefined;
-            if (this.configured)
-                this.start();
+            this.cloudStatus = 'Signing in shortly...';
+            clearTimeout(this.credentialTimer);
+            this.credentialTimer = setTimeout(() => {
+                if (this.configured)
+                    this.start();
+            }, 3000);
         }
         else if (['rtspPort', 'apiPort', 'go2rtcLogLevel', 'go2rtcBinary'].includes(key)) {
             this.go2rtc.opts = this.go2rtcOptions();
