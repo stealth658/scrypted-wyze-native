@@ -53,9 +53,19 @@ docker run --rm -it --network host -v "$PWD":/app -w /app node:22 \
 | Log Raw Events | Log every event from Wyze, to see what your cameras send. |
 | Ignore Cameras | MAC addresses to leave out. |
 | go2rtc ports | Local RTSP (48554) and API (41984) ports, localhost only. Change if something else uses them. |
+| Fix Stream Description | On by default. See "Black HomeKit recordings" below. |
+| Stream Proxy Port | Local port (48555) Scrypted reads video from, localhost only. |
 
 ## Limits
 
 - Motion arrives a few seconds after it happens, because it goes camera → Wyze → plugin. Scrypted's prebuffer covers the start of most recordings, but a slow day at Wyze could clip the first second or two.
 - Motion needs internet access. Video doesn't.
 - Every event type Wyze reports for a camera currently counts as motion. Turn on **Log Raw Events** to see what yours send.
+
+## Black HomeKit recordings (fixed in 0.1.2)
+
+go2rtc 1.9.15 describes a Wyze stream using the first settings the camera sends, right after asking it to switch to HD. The camera is often still sending 360p at that moment, so the description says 360p while the video is HD. Live view works anyway, but HomeKit Secure Video recordings copy the description into the clip's header and play back black.
+
+The plugin puts a small local relay between Scrypted and go2rtc. Video passes through untouched. The relay only replaces the stream description with the settings the camera is actually sending, and checks again shortly after the stream starts and every couple of minutes. If the camera's resolution changes later, it restarts that stream so the description matches again (Scrypted reconnects within a few seconds).
+
+The plugin log shows what it did, for example `Garage: corrected stream description from 640x360 High level 4.1 to 2304x1296 Main level 5.` Turn **Fix Stream Description** off to read go2rtc directly.

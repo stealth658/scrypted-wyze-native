@@ -18,6 +18,7 @@ import sdk, {
 import os from 'os';
 import path from 'path';
 import { Go2rtc, GO2RTC_VERSION } from './go2rtc';
+import { SdpFixProxy } from './sdp-fix';
 import { go2rtcSourceUrl, WyzeCamera, WyzeCloud, WyzeEvent, WyzeRateLimitError, WyzeTokens } from './wyze-cloud';
 
 const CREDENTIAL_KEYS = ['email', 'password', 'apiId', 'apiKey'];
@@ -76,7 +77,7 @@ export class WyzeCameraDevice extends ScryptedDeviceBase implements VideoCamera,
     async getVideoStream(options?: RequestMediaStreamOptions): Promise<MediaObject> {
         const vsos = await this.getVideoStreamOptions();
         const vso = vsos.find(v => v.id === options?.id) || vsos[0];
-        const url = this.plugin.go2rtc.rtspUrl(streamName(this.nativeId!, vso.id === 'sd'));
+        const url = this.plugin.streamUrl(streamName(this.nativeId!, vso.id === 'sd'));
         const ret: MediaStreamUrl = {
             container: 'rtsp',
             url,
@@ -120,6 +121,7 @@ export class WyzeNativePlugin extends ScryptedDeviceBase implements DeviceProvid
     cameras = new Map<string, WyzeCamera>();
     devices = new Map<string, WyzeCameraDevice>();
     go2rtc: Go2rtc;
+    sdpFix: SdpFixProxy;
     cloud?: WyzeCloud;
     private pollTimer?: NodeJS.Timeout;
     private refreshTimer?: NodeJS.Timeout;
@@ -134,6 +136,16 @@ export class WyzeNativePlugin extends ScryptedDeviceBase implements DeviceProvid
     constructor(nativeId?: string) {
         super(nativeId);
         this.go2rtc = new Go2rtc(this.go2rtcOptions(), this.console);
+        this.sdpFix = new SdpFixProxy({
+            listenPort: this.proxyPort,
+            upstreamPort: this.go2rtc.opts.rtspPort,
+            probeTimeoutMs: 10000,
+            enabled: () => this.storage.getItem('fixDescription') !== 'false',
+            nameForPath: streamPath => this.nameForStreamPath(streamPath),
+        }, this.console);
+        this.sdpFix.start().catch(e => {
+            this.console.error(`stream proxy couldn't listen on 127.0.0.1:${this.proxyPort}, so cameras are reading go2rtc directly and recordings may be black. Change the Stream Proxy Port in settings.`, e);
+        });
         try {
             for (const c of JSON.parse(this.storage.getItem('cameraCache') || '[]') as WyzeCamera[])
                 this.cameras.set(c.mac, c);
@@ -142,6 +154,26 @@ export class WyzeNativePlugin extends ScryptedDeviceBase implements DeviceProvid
         }
         process.once('exit', () => this.go2rtc.stop());
         process.nextTick(() => this.start());
+    }
+
+    get proxyPort() {
+        return parseInt(this.storage.getItem('proxyPort') || '') || 48555;
+    }
+
+    /** Scrypted reads video through the description-fixing proxy, which passes everything else straight to go2rtc. */
+    streamUrl(stream: string) {
+        // if the proxy couldn't get its port, video straight from go2rtc beats no video.
+        return this.sdpFix.failed ? this.go2rtc.rtspUrl(stream) : this.sdpFix.rtspUrl(stream);
+    }
+
+    private nameForStreamPath(streamPath: string) {
+        for (const c of this.cameras.values()) {
+            if (streamPath === `/${streamName(c.mac, false)}`)
+                return c.nickname;
+            if (streamPath === `/${streamName(c.mac, true)}`)
+                return `${c.nickname} (SD)`;
+        }
+        return streamPath;
     }
 
     private go2rtcOptions() {
@@ -386,6 +418,7 @@ export class WyzeNativePlugin extends ScryptedDeviceBase implements DeviceProvid
     async release() {
         this.releasing = true;
         clearTimeout(this.pollTimer);
+        await this.sdpFix.stop();
         await this.go2rtc.stop();
     }
 
@@ -411,6 +444,12 @@ export class WyzeNativePlugin extends ScryptedDeviceBase implements DeviceProvid
             { group: 'go2rtc', key: 'go2rtcStatus', title: 'Status', readonly: true, value: `${this.go2rtc.status}, version ${GO2RTC_VERSION}` },
             { group: 'go2rtc', key: 'rtspPort', title: 'Local RTSP Port', type: 'number', placeholder: '48554', value: this.storage.getItem('rtspPort'), description: 'Port go2rtc serves video on, localhost only.' },
             { group: 'go2rtc', key: 'apiPort', title: 'Local API Port', type: 'number', placeholder: '41984', value: this.storage.getItem('apiPort') },
+            {
+                group: 'go2rtc', key: 'fixDescription', title: 'Fix Stream Description', type: 'boolean',
+                value: this.storage.getItem('fixDescription') !== 'false',
+                description: "go2rtc can describe a Wyze stream with the camera's 360p settings while the camera sends HD, which makes HomeKit recordings black. When on, the plugin checks the settings the camera actually sends and corrects the description.",
+            },
+            { group: 'go2rtc', key: 'proxyPort', title: 'Stream Proxy Port', type: 'number', placeholder: '48555', value: this.storage.getItem('proxyPort'), description: `Local port Scrypted reads video from, localhost only. ${this.sdpFix.status}.` },
             { group: 'go2rtc', key: 'go2rtcLogLevel', title: 'Log Level', choices: ['trace', 'debug', 'info', 'warn', 'error'], value: this.storage.getItem('go2rtcLogLevel') || 'info' },
             { group: 'go2rtc', key: 'go2rtcBinary', title: 'Binary Path Override', value: this.storage.getItem('go2rtcBinary'), description: 'Optional: use your own go2rtc binary instead of the pinned download.' },
         ];
@@ -440,7 +479,14 @@ export class WyzeNativePlugin extends ScryptedDeviceBase implements DeviceProvid
         }
         else if (['rtspPort', 'apiPort', 'go2rtcLogLevel', 'go2rtcBinary'].includes(key)) {
             this.go2rtc.opts = this.go2rtcOptions();
+            this.sdpFix.opts.upstreamPort = this.go2rtc.opts.rtspPort;
             this.go2rtc.start().catch(e => this.console.error('go2rtc restart failed', e));
+        }
+        else if (key === 'proxyPort') {
+            this.sdpFix.opts.listenPort = this.proxyPort;
+            this.sdpFix.start()
+                .then(() => this.console.log(`stream proxy now on 127.0.0.1:${this.proxyPort}. Restart the plugin so cameras pick up the new address.`))
+                .catch(e => this.console.error('stream proxy restart failed', e));
         }
         else if (key === 'ignoredMacs') {
             this.applyCameras();
