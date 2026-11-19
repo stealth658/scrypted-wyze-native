@@ -18,6 +18,7 @@ import sdk, {
 import os from 'os';
 import path from 'path';
 import { Go2rtc, GO2RTC_VERSION } from './go2rtc';
+import { findIpByMac } from './lan';
 import { SdpFixProxy } from './sdp-fix';
 import { go2rtcSourceUrl, WyzeCamera, WyzeCloud, WyzeEvent, WyzeRateLimitError, WyzeTokens } from './wyze-cloud';
 
@@ -105,7 +106,7 @@ export class WyzeCameraDevice extends ScryptedDeviceBase implements VideoCamera,
             },
             { key: 'lastEvent', title: 'Last Wyze Event', readonly: true, value: this.lastEvent },
             { key: 'model', title: 'Model', readonly: true, value: cam ? `${MODEL_NAMES[cam.model] || 'Unknown'} (${cam.model})` : '' },
-            { key: 'ip', title: 'Camera IP', readonly: true, value: cam?.ip || '' },
+            { key: 'ip', title: 'Camera IP', readonly: true, value: cam ? this.plugin.describeIp(cam) : '' },
             { key: 'mac', title: 'MAC', readonly: true, value: cam?.mac || '' },
             { key: 'dtls', title: 'DTLS', readonly: true, value: cam ? (cam.dtls ? 'Yes' : 'No (go2rtc may not support this firmware)') : '' },
         ];
@@ -270,6 +271,8 @@ export class WyzeNativePlugin extends ScryptedDeviceBase implements DeviceProvid
     /** shortest and longest wait between those checks; the wait doubles while nothing changes. */
     addressRecheckMinMs = 5 * 60 * 1000;
     addressRecheckMaxMs = 60 * 60 * 1000;
+    /** search the local network when the camera isn't already in the neighbour table. */
+    addressSweep = true;
     private unreachable = new Map<string, { count: number, last: number, nextCheck: number, wait: number }>();
 
     /**
@@ -301,24 +304,68 @@ export class WyzeNativePlugin extends ScryptedDeviceBase implements DeviceProvid
         this.recheckAddress(mac).catch(e => this.console.error('address check failed', (e as Error).message));
     }
 
+    /**
+     * Addresses found on the local network that differ from what Wyze lists, by camera MAC.
+     * Each is remembered together with the Wyze address it replaced, and dropped once Wyze lists something else.
+     */
+    private localAddresses(): Record<string, { wyzeIp: string, ip: string }> {
+        try {
+            return JSON.parse(this.storage.getItem('localAddresses') || '{}');
+        }
+        catch (e) {
+            return {};
+        }
+    }
+
+    effectiveIp(cam: WyzeCamera) {
+        const local = this.localAddresses()[cam.mac];
+        return local && local.wyzeIp === cam.ip ? local.ip : cam.ip;
+    }
+
+    describeIp(cam: WyzeCamera) {
+        const ip = this.effectiveIp(cam);
+        return ip === cam.ip ? ip : `${ip} (found on your network; Wyze lists ${cam.ip})`;
+    }
+
+    private setLocalAddress(cam: WyzeCamera, ip: string | undefined) {
+        const all = this.localAddresses();
+        if (ip)
+            all[cam.mac] = { wyzeIp: cam.ip, ip };
+        else
+            delete all[cam.mac];
+        this.storage.setItem('localAddresses', JSON.stringify(all));
+    }
+
     private async recheckAddress(mac: string) {
         const before = this.cameras.get(mac);
-        if (!before || !this.cloud || this.cloud.blockedUntil > Date.now())
+        if (!before)
             return;
-        await this.refreshCameras();
+        const triedIp = this.effectiveIp(before);
+        if (this.cloud && this.cloud.blockedUntil <= Date.now())
+            await this.refreshCameras();
         const after = this.cameras.get(mac);
         if (!after) {
-            this.console.warn(`${before.nickname} isn't answering at ${before.ip}, and Wyze no longer lists it with a local address.`);
+            this.console.warn(`${before.nickname} isn't answering at ${triedIp}, and Wyze no longer lists it with a local address.`);
+            return;
         }
-        else if (after.ip !== before.ip || after.enr !== before.enr || after.p2pId !== before.p2pId) {
-            const what = after.ip !== before.ip ? `moved from ${before.ip} to ${after.ip}` : 'has new connection details';
+        if (this.effectiveIp(after) !== triedIp || after.enr !== before.enr || after.p2pId !== before.p2pId) {
+            const what = this.effectiveIp(after) !== triedIp ? `moved from ${triedIp} to ${this.effectiveIp(after)}` : 'has new connection details';
             this.console.log(`${after.nickname} ${what}. Reconnecting.`);
             this.unreachable.delete(mac);
+            return;
         }
-        else {
-            const mins = Math.max(1, Math.round(((this.unreachable.get(mac)?.nextCheck ?? 0) - Date.now()) / 60000));
-            this.console.warn(`${after.nickname} isn't answering at ${after.ip}, and Wyze still lists that address. It may be offline or need a power cycle. Checking again in about ${mins} min if this continues.`);
+        // Wyze has nothing new. Its record can be stale, so look for the camera on the local network by its MAC.
+        const found = await findIpByMac(mac, triedIp, { sweep: this.addressSweep });
+        if (found && found !== triedIp) {
+            this.console.log(`${after.nickname} is at ${found} on your network, but Wyze lists ${after.ip}. Using ${found}.`);
+            this.setLocalAddress(after, found === after.ip ? undefined : found);
+            this.unreachable.delete(mac);
+            await this.applyCameras();
+            return;
         }
+        const mins = Math.max(1, Math.round(((this.unreachable.get(mac)?.nextCheck ?? 0) - Date.now()) / 60000));
+        const where = found ? `It is on your network at that address, so it may need a restart from the Wyze app.` : `It wasn't found on your network either, so it may be offline.`;
+        this.console.warn(`${after.nickname} isn't answering at ${triedIp}. ${where} Checking again in about ${mins} min if this continues.`);
     }
 
     private saveTokens() {
@@ -337,15 +384,16 @@ export class WyzeNativePlugin extends ScryptedDeviceBase implements DeviceProvid
         for (const cam of this.cameras.values()) {
             if (ignored.has(cam.mac.toUpperCase()))
                 continue;
-            streams[streamName(cam.mac, false)] = go2rtcSourceUrl(cam, 'hd');
-            streams[streamName(cam.mac, true)] = go2rtcSourceUrl(cam, 'sd');
+            const ip = this.effectiveIp(cam);
+            streams[streamName(cam.mac, false)] = go2rtcSourceUrl({ ...cam, ip }, 'hd');
+            streams[streamName(cam.mac, true)] = go2rtcSourceUrl({ ...cam, ip }, 'sd');
             const existing = known.has(cam.mac) ? deviceManager.getDeviceState(cam.mac) : undefined;
             const info = {
                 manufacturer: 'Wyze',
                 model: MODEL_NAMES[cam.model] ? `${MODEL_NAMES[cam.model]} (${cam.model})` : cam.model,
                 firmware: cam.firmware,
                 mac: cam.mac,
-                ip: cam.ip,
+                ip,
             };
             await deviceManager.onDeviceDiscovered({
                 nativeId: cam.mac,
@@ -493,7 +541,7 @@ export class WyzeNativePlugin extends ScryptedDeviceBase implements DeviceProvid
             { group: 'Wyze Account', key: 'refresh', title: 'Refresh Cameras', type: 'button', description: 'Reload the camera list from Wyze, e.g. after a camera changes IP.' },
             {
                 group: 'Cameras', key: 'cameraList', title: 'Cameras', readonly: true,
-                value: [...this.cameras.values()].map(c => `${c.nickname} (${c.model}, ${c.ip})`).join(', ') || 'None yet',
+                value: [...this.cameras.values()].map(c => `${c.nickname} (${c.model}, ${this.describeIp(c)})`).join(', ') || 'None yet',
             },
             { group: 'Cameras', key: 'ignoredMacs', title: 'Ignore Cameras (MAC)', value: this.storage.getItem('ignoredMacs'), description: 'Comma separated MAC addresses to leave out.' },
             { group: 'Motion', key: 'motionStatus', title: 'Status', readonly: true, value: this.motionStatus },

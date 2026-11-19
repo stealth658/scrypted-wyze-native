@@ -70,10 +70,16 @@ The plugin puts a small local relay between Scrypted and go2rtc. Video passes th
 
 The plugin log shows what it did, for example `Garage: corrected stream description from 640x360 High level 4.1 to 2304x1296 Main level 5.` Turn **Fix Stream Description** off to read go2rtc directly.
 
-## Camera stops streaming but works in the Wyze app (fixed in 0.1.3)
+## Camera stops streaming but works in the Wyze app (fixed in 0.1.4)
 
-go2rtc looks for each camera only at the IP address in its config, which the plugin reads from Wyze. If your router gives the camera a new address, go2rtc logs `discovery timeout` and the stream stays down, while the Wyze app keeps working because it finds the camera through Wyze's servers.
+go2rtc looks for each camera only at the IP address in its config, which the plugin reads from Wyze. If your router gives the camera a new address, go2rtc logs `discovery timeout` and the stream stays down. The Wyze app keeps working because it reaches the camera through Wyze's servers, and Wyze can go on listing the old address (the app shows that same stale value).
 
-When a camera keeps timing out, the plugin now asks Wyze for the camera list again. If the address changed, it restarts go2rtc with the new one and logs `<camera> moved from <old> to <new>. Reconnecting.` If Wyze still lists the same address, it says so and checks again later (after 5 minutes, then less often, up to hourly).
+When a camera keeps timing out, the plugin now:
+
+1. Asks Wyze for the camera list again, in case the address was updated.
+2. If Wyze has nothing new, looks for the camera's MAC address on your local network (the server's neighbour table, after a quick sweep of the camera's subnet if needed) and uses the address it finds. The log shows `<camera> is at <new> on your network, but Wyze lists <old>. Using <new>.`
+3. If the camera isn't found, or is found at the same address, says so and checks again later (after 5 minutes, then less often, up to hourly).
+
+The found address is remembered until Wyze lists a different one. This needs Scrypted to share the host's network (host networking in Docker), which HomeKit needs anyway.
 
 Giving the camera a fixed address in your router (a DHCP reservation) avoids the interruption entirely.
