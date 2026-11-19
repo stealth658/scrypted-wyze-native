@@ -136,6 +136,7 @@ export class WyzeNativePlugin extends ScryptedDeviceBase implements DeviceProvid
     constructor(nativeId?: string) {
         super(nativeId);
         this.go2rtc = new Go2rtc(this.go2rtcOptions(), this.console);
+        this.go2rtc.onLine = line => this.onGo2rtcLine(line);
         this.sdpFix = new SdpFixProxy({
             listenPort: this.proxyPort,
             upstreamPort: this.go2rtc.opts.rtspPort,
@@ -259,6 +260,64 @@ export class WyzeNativePlugin extends ScryptedDeviceBase implements DeviceProvid
                 this.cloudStatus = `Error: ${(e as Error).message}`;
             }
             this.console.error('could not load cameras from Wyze; using the cached list.', (e as Error).message);
+        }
+    }
+
+    // ---------- cameras that stop answering ----------
+
+    /** consecutive "discovery timeout" lines for a camera before asking Wyze where it is now. */
+    addressRecheckAfter = 3;
+    /** shortest and longest wait between those checks; the wait doubles while nothing changes. */
+    addressRecheckMinMs = 5 * 60 * 1000;
+    addressRecheckMaxMs = 60 * 60 * 1000;
+    private unreachable = new Map<string, { count: number, last: number, nextCheck: number, wait: number }>();
+
+    /**
+     * go2rtc looks for a camera only at the IP address in its config, which the plugin reads from Wyze.
+     * If the router gives the camera a new address, go2rtc reports "discovery timeout" forever.
+     * When a camera keeps timing out, re-read the camera list so a new address is picked up.
+     */
+    private onGo2rtcLine(line: string) {
+        const m = line.match(/discovery timeout.*stream=wyze_([0-9a-f]+)/i);
+        if (!m)
+            return;
+        const mac = [...this.cameras.keys()].find(k => k.toLowerCase() === m[1].toLowerCase());
+        if (!mac)
+            return;
+        const now = Date.now();
+        let state = this.unreachable.get(mac);
+        // timeouts more than a minute apart are separate episodes.
+        if (!state || now - state.last > 60000) {
+            const nextCheck = state && now < state.nextCheck ? state.nextCheck : 0;
+            state = { count: 0, last: now, nextCheck, wait: nextCheck ? state!.wait : this.addressRecheckMinMs };
+            this.unreachable.set(mac, state);
+        }
+        state.count++;
+        state.last = now;
+        if (state.count < this.addressRecheckAfter || now < state.nextCheck)
+            return;
+        state.nextCheck = now + state.wait;
+        state.wait = Math.min(state.wait * 2, this.addressRecheckMaxMs);
+        this.recheckAddress(mac).catch(e => this.console.error('address check failed', (e as Error).message));
+    }
+
+    private async recheckAddress(mac: string) {
+        const before = this.cameras.get(mac);
+        if (!before || !this.cloud || this.cloud.blockedUntil > Date.now())
+            return;
+        await this.refreshCameras();
+        const after = this.cameras.get(mac);
+        if (!after) {
+            this.console.warn(`${before.nickname} isn't answering at ${before.ip}, and Wyze no longer lists it with a local address.`);
+        }
+        else if (after.ip !== before.ip || after.enr !== before.enr || after.p2pId !== before.p2pId) {
+            const what = after.ip !== before.ip ? `moved from ${before.ip} to ${after.ip}` : 'has new connection details';
+            this.console.log(`${after.nickname} ${what}. Reconnecting.`);
+            this.unreachable.delete(mac);
+        }
+        else {
+            const mins = Math.max(1, Math.round(((this.unreachable.get(mac)?.nextCheck ?? 0) - Date.now()) / 60000));
+            this.console.warn(`${after.nickname} isn't answering at ${after.ip}, and Wyze still lists that address. It may be offline or need a power cycle. Checking again in about ${mins} min if this continues.`);
         }
     }
 

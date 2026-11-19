@@ -69,3 +69,11 @@ go2rtc 1.9.15 describes a Wyze stream using the first settings the camera sends,
 The plugin puts a small local relay between Scrypted and go2rtc. Video passes through untouched. The relay only replaces the stream description with the settings the camera is actually sending, and checks again shortly after the stream starts and every couple of minutes. If the camera's resolution changes later, it restarts that stream so the description matches again (Scrypted reconnects within a few seconds).
 
 The plugin log shows what it did, for example `Garage: corrected stream description from 640x360 High level 4.1 to 2304x1296 Main level 5.` Turn **Fix Stream Description** off to read go2rtc directly.
+
+## Camera stops streaming but works in the Wyze app (fixed in 0.1.3)
+
+go2rtc looks for each camera only at the IP address in its config, which the plugin reads from Wyze. If your router gives the camera a new address, go2rtc logs `discovery timeout` and the stream stays down, while the Wyze app keeps working because it finds the camera through Wyze's servers.
+
+When a camera keeps timing out, the plugin now asks Wyze for the camera list again. If the address changed, it restarts go2rtc with the new one and logs `<camera> moved from <old> to <new>. Reconnecting.` If Wyze still lists the same address, it says so and checks again later (after 5 minutes, then less often, up to hourly).
+
+Giving the camera a fixed address in your router (a DHCP reservation) avoids the interruption entirely.

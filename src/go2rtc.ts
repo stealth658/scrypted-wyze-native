@@ -66,6 +66,8 @@ export class Go2rtc {
     private restartTimer?: NodeJS.Timeout;
     private streams: Record<string, string> = {};
     status = 'Not started';
+    /** called with each line go2rtc logs. */
+    onLine?: (line: string) => void;
 
     constructor(public opts: Go2rtcOptions, public console: Console) {
         fs.mkdirSync(opts.filesDir, { recursive: true });
@@ -155,8 +157,14 @@ export class Go2rtc {
 
         const log = (data: Buffer) => {
             for (const line of data.toString().split('\n')) {
-                if (line.trim())
-                    this.console.log('[go2rtc]', line.trim());
+                if (!line.trim())
+                    continue;
+                this.console.log('[go2rtc]', line.trim());
+                try {
+                    this.onLine?.(line);
+                }
+                catch (e) {
+                }
             }
         };
         child.stdout?.on('data', log);
