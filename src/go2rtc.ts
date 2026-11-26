@@ -171,9 +171,12 @@ export class Go2rtc {
         child.stderr?.on('data', log);
         this.verify(child).catch(() => { });
         child.on('exit', (code, signal) => {
-            if (this.child === child)
+            // only the current go2rtc exiting unexpectedly calls for a restart; one this class
+            // stopped or replaced (even if it took a SIGKILL to die) does not.
+            const current = this.child === child;
+            if (current)
                 this.child = undefined;
-            if (this.stopping)
+            if (!current || this.stopping)
                 return;
             this.status = `Exited (${signal || code}), restarting`;
             this.console.error(`go2rtc exited (${signal || code}), restarting in 5s.`);

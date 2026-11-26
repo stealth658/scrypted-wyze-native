@@ -83,3 +83,9 @@ When a camera keeps timing out, the plugin now:
 The found address is remembered until Wyze lists a different one. This needs Scrypted to share the host's network (host networking in Docker), which HomeKit needs anyway.
 
 Giving the camera a fixed address in your router (a DHCP reservation) avoids the interruption entirely.
+
+## Camera stops streaming until the plugin is restarted (fixed in 0.1.5)
+
+After a camera's stream stalls, go2rtc 1.9.15 can get stuck: it keeps running and logs nothing, but never answers another request for that stream, so Scrypted reports `Operation Timed Out` on every retry. Motion events keep arriving because they come from Wyze's cloud.
+
+The plugin now notices when go2rtc leaves several stream requests in a row completely unanswered and restarts it, logging `go2rtc has stopped answering stream requests. Restarting it.` An offline camera doesn't trigger this, because go2rtc answers those requests with an error within seconds. Restarts are spaced out (2 minutes, doubling up to an hour) in case the cause is something a restart can't fix.

@@ -141,9 +141,11 @@ export class WyzeNativePlugin extends ScryptedDeviceBase implements DeviceProvid
         this.sdpFix = new SdpFixProxy({
             listenPort: this.proxyPort,
             upstreamPort: this.go2rtc.opts.rtspPort,
-            probeTimeoutMs: 10000,
+            // Scrypted gives up on a stream request after about 10 seconds, so answer well before that.
+            probeTimeoutMs: 6000,
             enabled: () => this.storage.getItem('fixDescription') !== 'false',
             nameForPath: streamPath => this.nameForStreamPath(streamPath),
+            onUnresponsive: () => this.onGo2rtcUnresponsive(),
         }, this.console);
         this.sdpFix.start().catch(e => {
             this.console.error(`stream proxy couldn't listen on 127.0.0.1:${this.proxyPort}, so cameras are reading go2rtc directly and recordings may be black. Change the Stream Proxy Port in settings.`, e);
@@ -262,6 +264,27 @@ export class WyzeNativePlugin extends ScryptedDeviceBase implements DeviceProvid
             }
             this.console.error('could not load cameras from Wyze; using the cached list.', (e as Error).message);
         }
+    }
+
+    // ---------- go2rtc stops answering ----------
+
+    private lastHangRestart = 0;
+    private hangRestartWait = 2 * 60 * 1000;
+
+    /**
+     * go2rtc can get stuck after a camera's stream stalls: it stays running and logs nothing, but never
+     * answers another request for that stream. Only restarting it clears that. Restarts are spaced out
+     * (2 minutes, doubling up to an hour) so a problem a restart can't fix doesn't cause a loop.
+     */
+    private onGo2rtcUnresponsive() {
+        const now = Date.now();
+        if (this.releasing || now - this.lastHangRestart < this.hangRestartWait)
+            return;
+        // a quiet spell since the last restart means that one worked; start the spacing over.
+        this.hangRestartWait = now - this.lastHangRestart > 2 * 60 * 60 * 1000 ? 2 * 60 * 1000 : Math.min(this.hangRestartWait * 2, 60 * 60 * 1000);
+        this.lastHangRestart = now;
+        this.console.warn('go2rtc has stopped answering stream requests. Restarting it.');
+        this.go2rtc.start().catch(e => this.console.error('go2rtc restart failed', (e as Error).message));
     }
 
     // ---------- cameras that stop answering ----------

@@ -201,6 +201,14 @@ export interface SdpFixOptions {
     firstRecheckMs?: number;
     recheckMs?: number;
     enabled: () => boolean;
+    /**
+     * Called when go2rtc has stopped answering stream requests: several in a row got no reply at all.
+     * (An offline camera is different: go2rtc answers those with an error within seconds.)
+     */
+    onUnresponsive?: () => void;
+    /** how long a request must go unanswered to count, and how many in a row. */
+    unresponsiveMs?: number;
+    unresponsiveCount?: number;
     nameForPath?: (streamPath: string) => string;
 }
 
@@ -209,6 +217,7 @@ export class SdpFixProxy {
     private sockets = new Set<net.Socket>();
     private lastLogged = new Map<string, string>();
     private generation = 0;
+    private unanswered = 0;
     status = 'Not started';
     /** true when the port couldn't be opened; streams should bypass the proxy. */
     failed = false;
@@ -285,7 +294,24 @@ export class SdpFixProxy {
         this.sockets.add(client);
         this.sockets.add(upstream);
         let recheckTimer: NodeJS.Timeout | undefined;
+        let describeSentAt = 0;
+        let describeAnswered = false;
+        let closed = false;
         const close = () => {
+            if (!closed) {
+                closed = true;
+                if (describeSentAt && !describeAnswered && Date.now() - describeSentAt >= (this.opts.unresponsiveMs ?? 8000)) {
+                    this.unanswered++;
+                    if (this.unanswered >= (this.opts.unresponsiveCount ?? 3)) {
+                        this.unanswered = 0;
+                        try {
+                            this.opts.onUnresponsive?.();
+                        }
+                        catch (e) {
+                        }
+                    }
+                }
+            }
             clearTimeout(recheckTimer);
             this.sockets.delete(client);
             this.sockets.delete(upstream);
@@ -318,6 +344,8 @@ export class SdpFixProxy {
                     catch (e) {
                     }
                     describePaths.push(path);
+                    describeSentAt = Date.now();
+                    describeAnswered = false;
                 }
                 if (request.startsWith('PLAY ')) {
                     // from here on the client only sends RTCP and keepalives; stop inspecting.
@@ -399,6 +427,10 @@ export class SdpFixProxy {
             }
         };
         const onUpstreamData = (data: Buffer) => {
+            if (describeSentAt && !describeAnswered) {
+                describeAnswered = true;
+                this.unanswered = 0;
+            }
             pending = Buffer.concat([pending, data]);
             pump().then(() => {
                 // data that arrived while a fix was in progress is picked up here.
